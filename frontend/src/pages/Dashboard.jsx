@@ -1,0 +1,1 @@
+export default function Dashboard(){ return (<div className="p-6"><h1 className="text-3xl font-semibold mb-6">VSPP ADO Sync Dashboard</h1><p>TODO: implement dual-column EPIC / Feature list.</p></div>);}

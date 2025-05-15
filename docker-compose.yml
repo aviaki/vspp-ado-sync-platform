@@ -1,0 +1,36 @@
+services:
+  backend:
+    build: ./backend
+    container_name: vspp-backend
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongo
+    networks: [vspp-net]
+
+  frontend:
+    build: ./frontend
+    container_name: vspp-frontend
+    env_file: .env
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    networks: [vspp-net]
+
+  mongo:
+    image: mongo:6
+    container_name: vspp-mongo
+    environment:
+      MONGO_INITDB_DATABASE: vspp
+    volumes:
+      - mongo_data:/data/db
+    networks: [vspp-net]
+
+networks:
+  vspp-net:
+    driver: bridge
+
+volumes:
+  mongo_data:
