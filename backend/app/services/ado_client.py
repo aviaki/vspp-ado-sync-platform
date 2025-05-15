@@ -1,46 +1,35 @@
-# backend/app/services/ado_client.py
 """
-Azure DevOps client helpers – pagination-aware
-──────────────────────────────────────────────
-All helpers are *async* and designed to be used from the FastAPI
-sync-daemon task.
+ADO client helpers — async, paginated, retry-aware.
 
-Key points
-──────────
-• _iter_ids()  – lazy generator that pages through work-item IDs using
-                 WIQL + continuationToken.
-• _fetch_items() – pulls complete work-item docs in ≤200-ID batches.
-• fetch_mk_feature_requests() / fetch_tm_epics() – convenience wrappers
-  that query the respective ADO org/project from settings.
+This module:
 
-Any future ADO queries should build on _iter_ids() + _fetch_items() so
-we never hit the 20 000-character URL or 200-ID API limits again.
+* wraps Azure DevOps REST calls with exponential-back-off retry
+* paginates large result sets via WIQL + continuation tokens
+* fetches work-items in chunks (to stay under URL length limits)
 """
+
 from __future__ import annotations
 
 import asyncio
 import base64
 import random
 import time
-from typing import AsyncIterator, List
+from typing import AsyncIterator, Iterable, List
 
 import httpx
 
 from ..core.config import get_settings
 
-# ---------------------------------------------------------------------
-# Common helpers
-# ---------------------------------------------------------------------
-
-_TRANSIENT: set[int] = {429, 500, 502, 503, 504}
-_CHUNK_IDS = 200            # max IDs per /workitems call
-_PAGE_SIZE = 5000           # WIQL “$top”; bigger → fewer round-trips
+# ────────────────────────── constants ──────────────────────────────
+_SETTINGS = get_settings()
+_TRANSIENT = {429, 500, 502, 503, 504}
+_API_VER = "7.1"
+_CHUNK_IDS = 190  # each work-items batch (= <= ~8 KB URL)
 
 
+# ────────────────────────── helpers ────────────────────────────────
 def _auth_header(pat: str) -> dict[str, str]:
-    """
-    Azure DevOps PAT is sent via basic-auth with empty user-name.
-    """
+    """Basic-auth header from PAT (username = empty)."""
     token = base64.b64encode(f":{pat}".encode()).decode()
     return {"Authorization": f"Basic {token}"}
 
@@ -52,189 +41,159 @@ async def _request_with_retry(
     *,
     headers: dict[str, str],
     json: dict | None = None,
-    stream: bool = False,
     max_retries: int = 5,
     backoff: float = 1.0,
     timeout: float = 60.0,
 ) -> httpx.Response:
-    """
-    Tiny exponential-backoff retry wrapper for the handful of transient
-    HTTP status codes ADO occasionally emits.
-    """
+    """HTTP request with exponential-jitter back-off on transient codes."""
+    hdrs = {"Accept": "application/json", **headers}
     for attempt in range(1, max_retries + 1):
         try:
             resp = await client.request(
                 method,
                 url,
-                headers=headers,
+                headers=hdrs,
                 json=json,
                 timeout=timeout,
-                stream=stream,
             )
             if resp.status_code not in _TRANSIENT:
                 resp.raise_for_status()
                 return resp
-        except (httpx.RequestError, httpx.HTTPStatusError):
-            pass  # handled below
+        except httpx.RequestError:
+            # network / TLS etc.
+            pass
 
-        # NB: don't hammer – jitter prevents thundering herd
+        # transient failure → back-off and retry
         sleep = backoff * (2 ** (attempt - 1)) * random.uniform(0.8, 1.2)
         await asyncio.sleep(min(sleep, 30))
 
-    # if we get here the last response still has error status
-    resp.raise_for_status()  # will raise HTTPStatusError
+    # last attempt raised or still transient → raise
+    resp.raise_for_status()
+    return resp  # for type-checker only
 
 
+# ─────────────────────── WIQL pagination ───────────────────────────
 async def _iter_ids(
-    client: httpx.AsyncClient,
     *,
+    pat: str,
     org: str,
     project: str,
-    pat: str,
-    wiql: str,
+    wi_type: str,
+    states: list[str] | None,
+    page_size: int = 2000,
 ) -> AsyncIterator[int]:
     """
-    Yield *all* matching work-item IDs, transparently following the
-    continuationToken that Azure DevOps returns when more rows are
-    available.
+    Yield work-item IDs of a given type / state filter, using WIQL
+    continuation tokens for pagination.
     """
-    hdr = {**_auth_header(pat), "Content-Type": "application/json"}
-    cont: str | None = None
+    hdr = _auth_header(pat) | {"Content-Type": "application/json"}
 
-    while True:
-        url = (
-            f"https://dev.azure.com/{org}/{project}/_apis/wit/wiql"
-            f"?api-version=7.1-preview&$top={_PAGE_SIZE}"
-        )
-        if cont:
-            url += f"&continuationToken={cont}"
+    state_clause = ""
+    if states:
+        joined = " OR ".join(f\"[System.State] = '{s}'\" for s in states)
+        state_clause = f"AND ({joined})"
 
-        resp = await _request_with_retry(
-            client, "POST", url, headers=hdr, json={"query": wiql}
-        )
-        data = resp.json()
+    wiql_body = {
+        "query": f"""
+            SELECT [System.Id]
+            FROM WorkItems
+            WHERE [System.TeamProject] = '{project}'
+              AND [System.WorkItemType] = '{wi_type}'
+              {state_clause}
+            ORDER BY [System.Id] ASC
+        """
+    }
 
-        for row in data.get("workItems", []):
-            yield row["id"]
+    cont_token: str | None = None
+    async with httpx.AsyncClient(base_url=f"https://dev.azure.com/{org}") as client:
+        while True:
+            url = (
+                f"/{project}/_apis/wit/wiql?api-version={_API_VER}"
+                f"&$top={page_size}"
+                + (f"&continuationToken={cont_token}" if cont_token else "")
+            )
+            resp = await _request_with_retry(
+                client, "POST", url, headers=hdr, json=wiql_body
+            )
+            data = resp.json()
+            for wi in data.get("workItems", []):
+                yield wi["id"]
 
-        cont = data.get("continuationToken")
-        if not cont:
-            break
+            cont_token = data.get("continuationToken")
+            if not cont_token:
+                break
 
 
 async def _fetch_items(
-    client: httpx.AsyncClient,
     *,
+    pat: str,
     org: str,
     project: str,
-    pat: str,
-    ids: List[int],
-) -> List[dict]:
-    """
-    Fetch full work-item documents in compliant ≤200-ID batches and
-    return them as a list.
-    """
-    hdr = _auth_header(pat)
-    out: list[dict] = []
-
-    for i in range(0, len(ids), _CHUNK_IDS):
-        block = ",".join(map(str, ids[i : i + _CHUNK_IDS]))
-        url = (
-            f"https://dev.azure.com/{org}/{project}/_apis/wit/workitems"
-            f"?ids={block}&$expand=all&api-version=7.1-preview"
-        )
-
-        resp = await _request_with_retry(client, "GET", url, headers=hdr)
-        out.extend(resp.json().get("value", []))
-
-    return out
-
-
-# ---------------------------------------------------------------------
-# Public helpers used by sync_daemon.py
-# ---------------------------------------------------------------------
-
-async def fetch_mk_feature_requests(
-    states: list[str] | None = None,
+    ids: Iterable[int],
+    expand: str = "all",
+    chunk: int = _CHUNK_IDS,
 ) -> list[dict]:
-    """
-    Return *all* MK Feature Request work-items matching the given
-    states (or every state when `states is None`).
-    """
-    s = get_settings()
-    wi_states = (
-        " AND (" + " OR ".join(f"[System.State] = '{st}'" for st in states) + ")"
-        if states
-        else ""
-    )
+    """Fetch work-items by ID chunks (<= URL length limit)."""
+    hdr = _auth_header(pat)
+    items: list[dict] = []
 
-    wiql = (
-        f"SELECT [System.Id] "
-        f"FROM WorkItems "
-        f"WHERE [System.TeamProject] = '{s.mk_ado_project}' "
-        f"AND   [System.WorkItemType] = 'Feature Request' "
-        f"{wi_states} "
-        f"ORDER BY [System.Id] ASC"
-    )
+    async with httpx.AsyncClient(base_url=f"https://dev.azure.com/{org}") as client:
+        ids_list = list(ids)
+        for i in range(0, len(ids_list), chunk):
+            block = ",".join(map(str, ids_list[i : i + chunk]))
+            url = (
+                f"/{project}/_apis/wit/workitems"
+                f"?ids={block}&api-version={_API_VER}&$expand={expand}"
+            )
+            resp = await _request_with_retry(client, "GET", url, headers=hdr)
+            items.extend(resp.json().get("value", []))
 
-    async with httpx.AsyncClient() as client:
-        ids = [wid async for wid in _iter_ids(
-            client,
+    return items
+
+
+# ─────────────────── high-level public helpers ──────────────────────
+async def fetch_mk_feature_requests(states: list[str] | None = None) -> list[dict]:
+    """Return MK Feature Request items (optionally filtered by state)."""
+    s = _SETTINGS
+    ids = [
+        wid
+        async for wid in _iter_ids(
+            pat=s.mk_ado_pat,
             org=s.mk_ado_org,
             project=s.mk_ado_project,
-            pat=s.mk_ado_pat,
-            wiql=wiql,
-        )]
-
-        if not ids:
-            return []
-
-        return await _fetch_items(
-            client,
-            org=s.mk_ado_org,
-            project=s.mk_ado_project,
-            pat=s.mk_ado_pat,
-            ids=ids,
+            wi_type="Feature Request",
+            states=states,
         )
+    ]
+    if not ids:
+        return []
+    return await _fetch_items(
+        pat=s.mk_ado_pat,
+        org=s.mk_ado_org,
+        project=s.mk_ado_project,
+        ids=ids,
+    )
 
 
 async def fetch_tm_epics(states: list[str] | None = None) -> list[dict]:
-    """
-    Return TechMahindra EPICs, paginated exactly the same way.
-    """
-    s = get_settings()
-    wi_states = (
-        " AND (" + " OR ".join(f"[System.State] = '{st}'" for st in states) + ")"
-        if states
-        else ""
-    )
-
-    wiql = (
-        f"SELECT [System.Id] "
-        f"FROM WorkItems "
-        f"WHERE [System.TeamProject] = '{s.tm_ado_project}' "
-        f"AND   [System.WorkItemType] = 'Epic' "
-        f"{wi_states} "
-        f"ORDER BY [System.Id] ASC"
-    )
-
-    async with httpx.AsyncClient() as client:
-        ids = [wid async for wid in _iter_ids(
-            client,
+    """Return TM Epic items (optionally filtered by state)."""
+    s = _SETTINGS
+    ids = [
+        wid
+        async for wid in _iter_ids(
+            pat=s.tm_ado_pat,
             org=s.tm_ado_org,
             project=s.tm_ado_project,
-            pat=s.tm_ado_pat,
-            wiql=wiql,
-        )]
-
-        if not ids:
-            return []
-
-        return await _fetch_items(
-            client,
-            org=s.tm_ado_org,
-            project=s.tm_ado_project,
-            pat=s.tm_ado_pat,
-            ids=ids,
+            wi_type="Epic",
+            states=states,
         )
+    ]
+    if not ids:
+        return []
+    return await _fetch_items(
+        pat=s.tm_ado_pat,
+        org=s.tm_ado_org,
+        project=s.tm_ado_project,
+        ids=ids,
+    )
 
