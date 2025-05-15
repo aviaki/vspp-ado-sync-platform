@@ -90,7 +90,7 @@ async def _iter_ids(
 
     state_clause = ""
     if states:
-        joined = " OR ".join(f\"[System.State] = '{s}'\" for s in states)
+        joined = " OR ".join(f\"[System.State] = '{s}'" for s in states)
         state_clause = f"AND ({joined})"
 
     wiql_body = {
